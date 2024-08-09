@@ -1,0 +1,268 @@
+random默认1804289383
+
+def PatchSelect(bv: BinaryView, patch_info: dict, tbr_addr: int, fbr_addr: int):
+    """不能直接patch csel和br指令为b.cond tbr_addr/b fbr_addr
+    因为原逻辑是cmp之后, 还会执行其他指令(因为编译的时候穿插在一块了), 最后再br reg, 
+    如果直接patch的话逻辑就改成了cmp之后直接跳了, 逻辑就不正确了, 所以将从cmp到br的指令重新移动构造
+    
+    Args:
+        bv (BinaryView): bv
+        patch_info (dict): cmp add jmp reg和所有涉及到的地址
+        tbr_addr (int): 满足cmp条件的跳转地址
+        fbr_addr (int): 不满足条件的跳转地址
+    """
+
+    """
+    具体做法为:
+    1. 一次混淆至少涉及以下7个指令(中间穿插着其他逻辑的指令):
+        mov     w10, #0x60
+        ...
+        mov     w11, #0x58
+        ...
+        cmp     w7, w22
+        ...
+        csel    x23, x11, x10, lt
+        ...
+        ldr     x25, [x12, x23]
+        ...
+        add     x7, x25, x13
+        ...
+        br      x7
+    2. 其中w10/w11是无用的, 因此可以改为如下:
+        nop
+        ...
+        nop
+        ...
+        cmp     w7, w22
+        ...
+        mrs     x10, NZCV
+        ...
+        ...
+        msr     NZCV, x10
+        b.lt    ...
+        b       ...
+
+    """
+    cmp_addr = patch_info['cmp']
+    select_addr = patch_info['select']
+    add_addr = patch_info['add']
+    jmp_addr = patch_info['jmp']
+    involve_addrs = patch_info['involves']
+    #从cmp到br可以存放多少个字节(包括br不包括cmp)
+    insn_space = jmp_addr + bv.get_instruction_length(jmp_addr) - (cmp_addr + bv.get_instruction_length(cmp_addr))
+
+    #1. 拿到所有要操作的指令
+    cmp2br_insns_text = [] #从cmp到br中的所有指令文本 (不包含cmp并且删去了混淆指令)
+    read_addr = cmp_addr + bv.get_instruction_length(cmp_addr)
+    while read_addr < jmp_addr:
+        op_text = bv.get_disassembly(read_addr)
+
+        if read_addr not in involve_addrs:
+            cmp2br_insns_text.append(op_text)
+
+        op_len = bv.get_instruction_length(read_addr)
+        read_addr += op_len
+    logger.log_debug(f"cmp2br_insns_text: {cmp2br_insns_text}")
+    #2. 获取add指令的最后一个寄存器
+    add_insn_token = (bv.get_disassembly(add_addr)).split()
+    add_reg = add_insn_token[-1]
+    add_reg_id = add_reg[1:] #寄存器号
+    #3. 获取cmp比较的寄存器
+    cmp_insn_token = (bv.get_disassembly(cmp_addr)).split()
+    cmp_reg1 = cmp_insn_token[1][:-1] #去掉逗号
+    cmp_reg_size = cmp_reg1[0] #寄存器w/x
+    cmp_reg2 = cmp_insn_token[2]
+    #4. 在cmp后插入mov指令
+    new_reg = cmp_reg_size + add_reg_id
+    mov_insn_text = f"mov {new_reg}, {cmp_reg1}"
+    cmp2br_insns_text.insert(0, mov_insn_text)
+    #5. 在末尾插入cmp和跳转指令
+    new_cmp_insn = f"cmp {new_reg}, {cmp_reg2}"
+    cmp2br_insns_text.append(new_cmp_insn)
+    csx_tokens = (bv.get_disassembly(select_addr)).split() #获取csel/cset/csinc的条件
+    csx_cond = csx_tokens[-1] #条件eq/lt等
+    bcc_cond = 'b.' + csx_cond
+    bcc_txt = f"{bcc_cond} {hex(tbr_addr)}"
+    cmp2br_insns_text.append(bcc_txt)
+    b_txt = f"b {hex(fbr_addr)}"
+    cmp2br_insns_text.append(b_txt)
+    logger.log_info(f"cmp2br_insns_text: {cmp2br_insns_text}")
+    
+    #将重新构造的指令从cmp下一条指令开始写入
+    new_opcodes = b''
+    begin_addr = cmp_addr + bv.get_instruction_length(cmp_addr) #开始写的地址
+    for insn_txt in cmp2br_insns_text[:-2]: #最后俩个跳转指令单独汇编
+        new_opcodes += bv.arch.assemble(insn_txt)
+
+    bcc_begin_addr = begin_addr + len(new_opcodes)
+    bcc_opcode = bv.arch.assemble(f"{bcc_cond} {hex(tbr_addr - bcc_begin_addr)}", bcc_begin_addr)
+    new_opcodes += bcc_opcode
+    b_begin_addr = begin_addr + len(new_opcodes)
+    b_opcode = bv.arch.assemble(f"b {hex(fbr_addr - b_begin_addr)}", b_begin_addr)
+    new_opcodes += b_opcode
+
+    new_space = len(new_opcodes)
+    logger.log_debug(f"space cmp: {insn_space} -> {new_space}")
+    if new_space > insn_space:
+        logger.log_error(f"新产生的机器码数量{new_space} > 原先的大小{insn_space}")
+        return
+    elif new_space < insn_space:
+        nop_bytes = b'\x00' * (insn_space - new_space)
+        nop_bytes = bv.arch.convert_to_nop(nop_bytes, begin_addr + new_space)
+        new_opcodes += nop_bytes
+
+    state = bv.begin_undo_actions()
+    bv.write(begin_addr, new_opcodes)
+    bv.commit_undo_actions(state)
+
+
+# 找到add指令地址 从末尾br指令开始往上找
+add_insn_addr = 0
+sorted_addr = sorted(involve_asm_addrs, reverse=True)
+for addr in sorted_addr:
+    op_tokens = (bv.get_disassembly(addr)).split()
+    if op_tokens[0] == 'add':
+        add_insn_addr = addr
+        break
+if add_insn_addr == 0:
+    logger.log_error("未找到add指令!")
+    return
+logger.log_debug(f"add_insn_addr: {hex(add_insn_addr)}")
+
+
+
+def PatchSelect(bv: BinaryView, patch_info: dict, tbr_addr: int, fbr_addr: int):
+    """不能直接patch csel和br指令为b.cond tbr_addr/b fbr_addr
+    因为原逻辑是cmp之后, 还会执行其他指令(因为编译的时候穿插在一块了), 最后再br reg, 
+    如果直接patch的话逻辑就改成了cmp之后直接跳了, 逻辑就不正确了, 所以将从cmp到br的指令重新移动构造
+    
+    Args:
+        bv (BinaryView): bv
+        patch_info (dict): csx jmp reg和所有涉及到的地址
+        tbr_addr (int): 满足cmp条件的跳转地址
+        fbr_addr (int): 不满足条件的跳转地址
+    """
+
+    """
+    具体做法为:
+    1. 一次混淆至少涉及以下7个指令(中间穿插着其他逻辑的指令):
+        mov     w10, #0x60
+        ...
+        mov     w11, #0x58
+        ...
+        cmp     w7, w22
+        ...
+        csel    x23, x11, x10, lt
+        ...
+        ldr     x25, [x12, x23]
+        ...
+        add     x7, x25, x13
+        ...
+        br      x7
+    2. 必须保证真实跳转地址的块不会被改变, 因此需要改为如下:
+        mov     w10, #0x60      <- 可以nop掉 不nop也不影响结果
+        ...
+        mov     w11, #0x58     
+        ...
+        cmp     w7, w22
+        ...
+        nop                     <-  csel    x23, x11, x10, lt
+        ...
+        nop                     <-  其他涉及到的指令
+        ...
+        nop                     <-  ldr     x25, [x12, x23]
+        b.lt    ...             <-  add     x7, x25, x13
+        b       ...             <-  br      x7
+    大多只有第一次混淆的时候这些混淆指令会穿插在一起, 之后基本都是ldr+add+br一个整体了
+    """
+    cond_addr = patch_info['cond']
+    jmp_addr = patch_info['jmp']
+    involve_addrs = patch_info['involves']
+    #从csx到br可以存放多少个字节(包括br)
+    insn_space = jmp_addr - cond_addr + bv.get_instruction_length(jmp_addr)
+ 
+    #1. 拿到所有要操作的指令
+    obf_insns_index = [] #指在cmp2br_insns_text中的index
+    csx2br_insns_text = [] #从csx到br中的所有指令文本 (包含csx不包含br)
+    read_addr = cond_addr
+    index = 0
+    while read_addr < jmp_addr:
+        op_text = bv.get_disassembly(read_addr)        
+        csx2br_insns_text.append(op_text)
+        
+        if read_addr in involve_addrs:
+            obf_insns_index.append(index)
+
+        op_len = bv.get_instruction_length(read_addr)
+        read_addr += op_len
+
+        index += 1
+    logger.log_debug(f"cmp2br_insns_text: {csx2br_insns_text}")
+    #0. 将混淆指令全转为nop, 并删除最后一个nop
+    for i in obf_insns_index:
+        csx2br_insns_text[i] = 'nop'
+    csx2br_insns_text.pop(obf_insns_index[-1])
+
+    #1. 获取select指令的寄存器 并添加跳转
+    csx_tokens = (bv.get_disassembly(cond_addr)).split() #获取csel/cset/csinc等的token
+    csx_cond = csx_tokens[-1] #条件eq/lt等
+    bcc_cond = 'b.' + csx_cond
+    bcc_txt = f"{bcc_cond} {hex(tbr_addr)}"
+    csx2br_insns_text.append(bcc_txt)
+    b_txt = f"b {hex(fbr_addr)}"
+    csx2br_insns_text.append(b_txt)
+    logger.log_info(f"csx2br_insns_text: {csx2br_insns_text}")
+
+    #4. 将重新构造的指令从sex指令开始写入
+    if (bv.arch.name == "aarch64"): #64位下指令长度固定为4, 对比哪些指令发生了变化再写哪些指令
+        changed_insns = {}#{地址:opcode}
+        index = 0
+        for insn_txt in csx2br_insns_text:
+            cmp_addr = cond_addr + 4 * index
+            org_insn_txt = bv.get_disassembly(cmp_addr)
+            if (org_insn_txt != insn_txt):
+                opcode = None
+                insn_tokens = insn_txt.split()
+                if (insn_tokens[0][0] == 'b') and (insn_tokens[1][0] == '0'): #跳转指令需要写相对地址
+                    bcc_type = insn_tokens[0]
+                    bcc_addr = int(insn_tokens[1], 16)
+                    bcc_opcode = bv.arch.assemble(f"{bcc_type} {hex(bcc_addr - cmp_addr)}", cmp_addr)
+                    opcode = bcc_opcode
+                else:
+                    opcode = bv.arch.assemble(insn_txt)
+                changed_insns[cmp_addr] = opcode
+            index += 1
+        logger.log_info(f"开始对比写入:{hex(cond_addr)}...")
+        state = bv.begin_undo_actions()
+        for addr in changed_insns.keys():
+            bv.write(addr, changed_insns[addr])
+        bv.commit_undo_actions(state)
+    else:
+        new_opcodes = b''
+        begin_addr = cond_addr #开始写的地址
+        for insn_txt in csx2br_insns_text: #跳转指令需要单独汇编
+            insn_tokens = insn_txt.split()
+            if (insn_tokens[0][0] == 'b') and (insn_tokens[1][0] == '0'): #跳转指令需要写相对地址
+                bcc_type = insn_tokens[0]
+                bcc_addr = int(insn_tokens[1], 16)
+                bcc_begin_addr = begin_addr + len(new_opcodes)
+                bcc_opcode = bv.arch.assemble(f"{bcc_type} {hex(bcc_addr - bcc_begin_addr)}", bcc_begin_addr)
+                new_opcodes += bcc_opcode
+            else:
+                new_opcodes += bv.arch.assemble(insn_txt)
+
+        new_space = len(new_opcodes)
+        if new_space != insn_space:
+            logger.log_warn(f"前后机器码大小不一致: {insn_space} -> {new_space} 分析可能出错!")
+        logger.log_debug(f"space cmp: {insn_space} -> {new_space}")
+        if new_space > insn_space:
+            logger.log_error(f"新产生的机器码数量{new_space} > 原先的大小{insn_space}")
+            return
+        elif new_space < insn_space:
+            nop_bytes = b'\x00' * (insn_space - new_space)
+            nop_bytes = bv.arch.convert_to_nop(nop_bytes, begin_addr + new_space)
+            new_opcodes += nop_bytes
+        logger.log_info(f"开始全部写入:{hex(begin_addr)}...")
+        state = bv.begin_undo_actions()
+        bv.write(begin_addr, new_opcodes)
+        bv.commit_undo_actions(state)
