@@ -1,6 +1,6 @@
 from binaryninja import *
 from binaryninja.log import Logger
-from .emulate import x86DeflatEmulate, armDeflatEmulate
+from .emulate import armDeflatEmulate
 
 from typing import List, Union
 from dataclasses import dataclass
@@ -65,7 +65,7 @@ def get_ahead_csel_addr(func, arg_addr):
 
     assign_insn_index = func.mlil.ssa_form.get_instruction_start(arg_addr)
     assign_insn = func.mlil.ssa_form[assign_insn_index]
-    logger.log_debug(f"判断提前: {hex(arg_addr)} => {assign_insn}")
+    logger.log_debug(f"[判断提前]: {hex(arg_addr)} => {assign_insn}")
 
     use_insn_ = assign_insn
     if isinstance(use_insn_.il_basic_block[-1], MediumLevelILIf):
@@ -99,7 +99,7 @@ def get_ahead_csel_addr(func, arg_addr):
 通过mlil层面拿到所有给var赋值的语句, 该语句所在的块就是真实块, 
 然后获取到当前块把var改成什么值了, 通过模拟执行该值会到达哪个块来确定后继块
 """
-def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable): 
+def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable, extra_real_addr = None, manual_value = None, witch_check = False): 
     #从mlil层面或者mlil ssa层面分析都可以, 我感觉ssa层面更方便一点
     loop_phi_var_insn = switch_var_ssa.def_site #循环分发开始的那个获取var值的指令
     if not isinstance(loop_phi_var_insn, MediumLevelILVarPhi):
@@ -121,12 +121,13 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
             dispatch_sbb.append(cur_mlil_ssa_bb.source_block)
     b_bb = []
     for bb in dispatch_sbb:
-        insn_token = bv.get_disassembly(bb.end).split() #bb的下一个地址处(+4)的指令
-        if insn_token[0] == 'b':
-            new_dispatch_bb = func.get_basic_block_at(bb.end)
-            if new_dispatch_bb.instruction_count == 1:
-                b_bb.append(new_dispatch_bb)
-    dispatch_sbb.extend(b_bb) #cmp块的相邻地址处如果是b的话也是分发块
+        for edge in bb.outgoing_edges:
+            suc_bb = edge.target
+            if (suc_bb.instruction_count == 1):
+                insn_token = suc_bb[0][0] #bb的后继块指令
+                if (insn_token[0].text)[0] == 'b': #如果是一个单独的b(.cc)的话
+                    b_bb.append(suc_bb)
+    dispatch_sbb.extend(b_bb) #cmp块的下一个块 如果是b(.cc)的话也是分发块
 
     #循环分发开始块的前继块都是初始化块
     pre_bb = loopEntry_sbb
@@ -182,8 +183,8 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
         cur_ssa_bb = assign_insn.il_basic_block
         disasm_bb = cur_ssa_bb.source_block
         real_sbb.append(disasm_bb)
-        #如果一个赋值块的指令较少(<=4) 且其有两个(两个以上的情况还没遇到过)直接前继, 且其前继块不是分发块, 则其前继块也是真实块, 该赋值块是共用的
-        if (disasm_bb.instruction_count <= 4) and (len(disasm_bb.incoming_edges) == 2): #>2块共用也有可能 遇到再改
+        #如果一个赋值块有两个(两个以上的情况还没遇到过)直接前继, 且其前继块不是分发块, 则其前继块也是真实块, 该赋值块是共用的
+        if (len(disasm_bb.incoming_edges) == 2): #>2块共用也有可能 遇到再改
             pre_edge1 = disasm_bb.incoming_edges[0]
             pre_edge2 = disasm_bb.incoming_edges[1]
             if (pre_edge1.type == BranchType.UnconditionalBranch) and (pre_edge2.type == BranchType.UnconditionalBranch):
@@ -247,17 +248,29 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
             logger.log_error("未知switch变量赋值指令类型...")
             return
         assign_bb_infos.append(cur_bb_info)
+    if (extra_real_addr != None): #添加用户额外设置的真实块地址
+        extra_sbb = func.get_basic_block_at(extra_real_addr)
+        real_sbb.append(extra_sbb)
 
+    
     #可选 把分发块的后继块当作真实块(如果一个函数有多个平坦化的话就需要这样 但这样获取的信息不一定是正确的)
-    for bb in dispatch_sbb:
-        for edge in bb.outgoing_edges:
-            suc_bb = edge.target
-            if (suc_bb not in dispatch_sbb) and (suc_bb not in init_sbb):
-                if (suc_bb not in real_sbb) and (suc_bb not in ret_sbb):
-                    if (suc_bb != loopEntry_sbb):
-                        real_sbb.append(suc_bb)
-    logger.log_warn("[!] 当前会使用分发块的后继块当作真实块 此行为可能导致分析错误 请注释掉这块代码!")
-
+    if witch_check:
+        for bb in dispatch_sbb:
+            for edge in bb.outgoing_edges:
+                suc_bb = edge.target
+                if (suc_bb not in dispatch_sbb) and (suc_bb not in init_sbb):
+                    if (suc_bb not in real_sbb) and (suc_bb not in ret_sbb):
+                        if (suc_bb != loopEntry_sbb): #且如果是b.ne/b.eq的话 则必须分别是false/true分支
+                            correct_bb = None
+                            bcc_type = dispatch_sbb[-1][0][0]
+                            if bcc_type == 'b.ne':
+                                correct_bb = dispatch_sbb.outgoing_edges[1].target #FalseBranch
+                            elif bcc_type == 'b.eq':
+                                correct_bb = dispatch_sbb.outgoing_edges[0].target #TrueBranch
+                            if (correct_bb == None) or (correct_bb == suc_bb):
+                                real_sbb.append(suc_bb)
+        logger.log_warn("[!] 当前会使用分发块的后继块当作真实块 此行为可能导致分析错误!")
+    
     logger.log_info("[0] 获取信息完毕!")
     logger.log_debug(f"init_sbb: {init_sbb}")
     logger.log_debug(f"real_sbb: {real_sbb}")
@@ -265,6 +278,24 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
     logger.log_debug(f"dispatch_sbb: {dispatch_sbb}")
     logger.log_debug(f"loopEntry_sbb: {loopEntry_sbb}")
     logger.log_debug(f"assign_bb_infos: {assign_bb_infos}")
+    common_sbb = []
+    for bb in real_sbb:
+        if bb in dispatch_sbb:
+            common_sbb.append(bb)
+    logger.log_debug(f"common_sbb: {common_sbb}")
+
+    i = 0
+    log_msg_ = ""
+    for info in assign_bb_infos:
+        log_msg_ += f"({i:02d}) {hex(info.bb_start)}"
+        if isinstance(info.var_value, AssignBBInfo.VarValueInfoU):
+            log_msg_ += f" ---> {hex(info.var_value.u_value)}"
+        elif isinstance(info.var_value, AssignBBInfo.VarValueInfoTF):
+            log_msg_ += f" --t-> {hex(info.var_value.t_value)}\n"
+            log_msg_ += f"({i:02d}) \t╰--f-> {hex(info.var_value.f_value)}"
+        log_msg_ += "\n"
+        i += 1
+    logger.log_debug(f"真实块的switch值:\n{log_msg_}")
 
     logger.log_info("[1] 开始模拟执行获取块之间后继关系...")
     #开始模拟执行!
@@ -293,7 +324,11 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
     deflat_emu.write_func_opcode(func_bytes) # 写入到emu内存中
 
     for bb in init_sbb:#执行init块的指令 (去掉了call)
-        deflat_emu.init_reg_stack(bb.start, bb.end)
+        end_addr = bb.end
+        last_insn_type = (bb[-1][0][0].text)[0]
+        if last_insn_type == 'b':
+            end_addr -= bb[-1][-1]
+        deflat_emu.init_reg_stack(bb.start, end_addr)
 
     # 1. 设置分发寄存器 (一般来讲是寄存器, 腾讯这个用的都是cmp w9, w22这种, 没见过用栈的)
     mlil_var = switch_var_ssa.var
@@ -316,39 +351,79 @@ def deflat2(bv: BinaryView, func: Function, switch_var_ssa: SSAVariable):
     deflat_emu.set_stop_addrs(stop_addrs)
 
     # 4. 获取赋值块的真实后继地址
-    for info in assign_bb_infos:
-        var_value = info.var_value
-        real_sucs_ = []
-        if isinstance(var_value, AssignBBInfo.VarValueInfoU): #只有一条赋值语句
-            deflat_emu.set_switch_var_value(var_value.u_value)
-            suc_addr = deflat_emu.start_until_stop()
-            real_sucs_.append(suc_addr)
+    if (manual_value != None):
+        deflat_emu.set_switch_var_value(manual_value)
+        logger.log_info(f"[*] 已设置{dispatch_reg}为: {hex(deflat_emu.reg_value(dispatch_reg))}")
+        suc_addr = deflat_emu.start_until_stop()
+        logger.log_info(f"[*] 当值为 {hex(manual_value)} 时 会到达---> {hex(suc_addr)}")
+        return
+    else:
+        cmp_regs = {}
+        if witch_check: #获取各个分发寄存器的初始值
+            for bb in dispatch_sbb:
+                index = 0
+                for insn_info in bb:
+                    if insn_info[0][0].text == 'cmp':
+                        wreg_name = insn_info[0][-2].text
+                        if (bb[index - 1][0][0].text == 'movk') and (bb[index - 1][0][2].text == wreg_name):
+                            pass #当前分发寄存器的初始值不是在init块中初始化的 是在当前块中赋值的
+                        else:
+                            xreg_name = 'x' + wreg_name[1:]
+                            cmp_regs[xreg_name] = 0
+                    index += 1
+            for reg in cmp_regs:
+                cmp_regs[reg] = deflat_emu.reg_value(reg)
+                logger.log_info(f"[C] {reg} 初始值: {hex(cmp_regs[reg])}")
 
-        elif isinstance(var_value, AssignBBInfo.VarValueInfoTF): #有两个赋值语句
-            deflat_emu.set_switch_var_value(var_value.t_value)
-            suc_addr = deflat_emu.start_until_stop()
-            real_sucs_.append(suc_addr)
+        for info in assign_bb_infos:
+            if witch_check: #每次进入分发逻辑之前初始化分发寄存器的值
+                for reg in cmp_regs:
+                    cur_value = deflat_emu.reg_value(reg)
+                    if cur_value != cmp_regs[reg]:
+                        logger.log_warn(f"[C] 当前分发寄存器{reg}的值为 {hex(cur_value)} =将改为初始值=> {hex(cmp_regs[reg])}")
+                        deflat_emu.reg_value(reg, cmp_regs[reg])
 
-            deflat_emu.set_switch_var_value(var_value.f_value)
-            suc_addr = deflat_emu.start_until_stop()
-            real_sucs_.append(suc_addr)
-        info.real_suc = real_sucs_
-    # 5. 打印输出
-    i = 0
-    log_msg_ = ""
-    for info in assign_bb_infos:
-        log_msg_ += f"({i:02d}) {hex(info.bb_start)}"
-        if isinstance(info.var_value, AssignBBInfo.VarValueInfoU):
-            log_msg_ += f" ---> {hex(info.real_suc[0])}"
-        elif isinstance(info.var_value, AssignBBInfo.VarValueInfoTF):
-            log_msg_ += f" --t-> {hex(info.real_suc[0])}\n"
-            log_msg_ += f"({i:02d}) \t╰--f-> {hex(info.real_suc[1])}"
-        log_msg_ += "\n"
-        i += 1
-    logger.log_info(f"[1] 模拟执行结束, 块之间后继关系:\n{log_msg_}")
-    
-    #开始Patch!
-    PatchAssignBB(bv, func, assign_bb_infos, real_sbb, dispatch_sbb)
+            var_value = info.var_value
+            real_sucs_ = []
+            #logger.log_warn(f"在 {hex(info.bb_start)} 前 w10: {hex(deflat_emu.reg_value('w10'))}")
+            if isinstance(var_value, AssignBBInfo.VarValueInfoU): #只有一条赋值语句
+                deflat_emu.set_switch_var_value(var_value.u_value)
+                suc_addr = deflat_emu.start_until_stop()
+                real_sucs_.append(suc_addr)
+
+            elif isinstance(var_value, AssignBBInfo.VarValueInfoTF): #有两个赋值语句
+                deflat_emu.set_switch_var_value(var_value.t_value)
+                suc_addr = deflat_emu.start_until_stop()
+                real_sucs_.append(suc_addr)
+
+                deflat_emu.set_switch_var_value(var_value.f_value)
+                suc_addr = deflat_emu.start_until_stop()
+                real_sucs_.append(suc_addr)
+            #logger.log_warn(f"在 {hex(info.bb_start)} 后 w10: {hex(deflat_emu.reg_value('w10'))}")
+            info.real_suc = real_sucs_
+        # 5. 打印输出
+        i = 0
+        log_msg_ = ""
+        for info in assign_bb_infos:
+            log_msg_ += f"({i:02d}) {hex(info.bb_start)}"
+            if isinstance(info.var_value, AssignBBInfo.VarValueInfoU):
+                log_msg_ += f" ---> {hex(info.real_suc[0])}"
+            elif isinstance(info.var_value, AssignBBInfo.VarValueInfoTF):
+                log_msg_ += f" --t-> {hex(info.real_suc[0])}\n"
+                log_msg_ += f"({i:02d}) \t╰--f-> {hex(info.real_suc[1])}"
+            log_msg_ += "\n"
+            i += 1
+        logger.log_info(f"[1] 模拟执行结束, 块之间后继关系:\n{log_msg_}")
+
+        #如果有后继是loopEntry的 则说明分析失败
+        for info in assign_bb_infos:
+            for suc in info.real_suc:
+                if suc == loopEntry_begin:
+                    logger.log_error(f"[!] 地址: {hex(info.bb_start)} 处后继分析失败! {hex(loopEntry_begin)}")
+                    return
+
+        #开始Patch!
+        PatchAssignBB(bv, func, assign_bb_infos, real_sbb, dispatch_sbb)
 
 
 def PatchAssignBB(bv: BinaryView, func: Function, abb_infos: List[AssignBBInfo], real_bb, dispatch_bb):
@@ -399,7 +474,7 @@ def PatchAssignBB(bv: BinaryView, func: Function, abb_infos: List[AssignBBInfo],
                 llast_insn_addr = last_insn_addr - cur_bb[-2][-1] #倒数第二个指令地址
                 if llast_insn_addr != info.set_var_addr:#如果不是倒数第二个的话就要去移动
                     logger.log_warn(f"csel指令不是当前块的倒数第二个指令!{hex(info.set_var_addr)} != {hex(llast_insn_addr)}")
-                    logger.log_warn(f"将会重新移动构造对应指令, 结果可能出错!...")
+                    logger.log_warn(f"[!] 将会重新移动构造对应指令, 结果可能出错!...")
                     #拿到csel到b的指令(不包括这两个指令) 相当于把csel-b之间的指令提前了: insns csel b
                     mid_insn_start = info.set_var_addr + bv.get_instruction_length(info.set_var_addr)
                     block_insn_bytes = bv.read(mid_insn_start, last_insn_addr - mid_insn_start)
@@ -484,7 +559,8 @@ def PatchAssignBB(bv: BinaryView, func: Function, abb_infos: List[AssignBBInfo],
                     nop_len = chain_bb3.length - len(fourth_bytes)
                     nop_bytes = b'\x00' * nop_len
                     nop_bytes = bv.arch.convert_to_nop(nop_bytes, new_insn_cur_addr)
-                    fourth_bytes += nop_bytes
+                    if nop_bytes != None:
+                        fourth_bytes += nop_bytes
                     fourth_patch.pbytes = fourth_bytes
                     third_patch.next = fourth_patch
                     
@@ -544,11 +620,9 @@ def PatchAssignBB(bv: BinaryView, func: Function, abb_infos: List[AssignBBInfo],
     logger.log_info("Patch无用块为nop完成!")
     """
 
-def deflat_cursor(bv: BinaryView, address: int):
-    target_func = bv.get_functions_containing(address)[0]#获取当前用户点击的函数
-    
+def get_address_switch_var(func: Function, address: int):
     cursor_mlil_ssa_bb = None #当前的mlil ssa视图中的bb
-    mlil_ssa_func = target_func.mlil.ssa_form
+    mlil_ssa_func = func.mlil.ssa_form
     for bb in mlil_ssa_func.basic_blocks:
         bb_addrs = [insn.address for insn in bb]
         if address in bb_addrs:
@@ -569,12 +643,55 @@ def deflat_cursor(bv: BinaryView, address: int):
                 cond_insn = cond_.src.def_site
                 ssa_var = cond_insn.src.vars_read[0]
             if ssa_var !=  None:
-                deflat2(bv, target_func, ssa_var)
-            else:
-                interaction.show_message_box("提示", "当前位置不存在switch var变量!\n请在Medium Level IL SSA视图中查找")
-        else:
-            interaction.show_message_box("提示", "当前位置不存在if指令!\n请在Medium Level IL SSA视图中查找")
+                return ssa_var
+    return None
 
+def deflat_cursor(bv: BinaryView, address: int):
+    target_func = bv.get_functions_containing(address)[0]#获取当前用户点击的函数
+    swtich_ssa_var = get_address_switch_var(target_func, address)
+    if swtich_ssa_var != None:
+        deflat2(bv, target_func, swtich_ssa_var)
     else:
-        interaction.show_message_box("提示", "当前位置不存在MLIL SSA BB!\n请在Medium Level IL SSA视图中查找")
+        interaction.show_message_box("提示", "当前位置不存在switch var变量!\n请在Medium Level IL SSA视图中查找")
+
+# 去除嵌套平坦化 需要手动设置出口地址
+def deflat_nested(bv: BinaryView, address: int):
+    target_func = bv.get_functions_containing(address)[0]#获取当前用户点击的函数
+    swtich_ssa_var = get_address_switch_var(target_func, address)
+    if swtich_ssa_var != None:
+        usr_input = interaction.get_address_input("请在下方输入当前平坦化循环的出口地址:", "输入出口地址")
+        if usr_input != None:
+            extra_sbb = target_func.get_basic_block_at(usr_input)
+            if (extra_sbb != None):
+                logger.log_info(f"使用用户输入的出口地址: {hex(usr_input)}")
+                deflat2(bv, target_func, swtich_ssa_var, usr_input)
+            else:
+                logger.log_error(f"用户输入{hex(usr_input)}无效 不是一个basicblock")
+        else:
+            logger.log_warn("用户取消输入")
+    else:
+        interaction.show_message_box("提示", "当前位置不存在switch var变量!\n请在Medium Level IL SSA视图中查找")
+
+# 每次循环都会将分发变量设置为初始值 且会将分发块的后继块当作真实块
+def deflat_with_check(bv: BinaryView, address: int):
+    target_func = bv.get_functions_containing(address)[0]#获取当前用户点击的函数
+    swtich_ssa_var = get_address_switch_var(target_func, address)
+    if swtich_ssa_var != None:
+        deflat2(bv, target_func, swtich_ssa_var, None, None, True)
+    else:
+        interaction.show_message_box("提示", "当前位置不存在switch var变量!\n请在Medium Level IL SSA视图中查找")
+
+# 手动设置switch变量的值 用于调试
+def deflat_manual(bv: BinaryView, address: int):
+    target_func = bv.get_functions_containing(address)[0]#获取当前用户点击的函数
+    swtich_ssa_var = get_address_switch_var(target_func, address)
+    if swtich_ssa_var != None:
+        switch_var_value = interaction.get_int_input("输入要设置的switch变量的值:", "手动设置switch变量值")
+        if (switch_var_value == None):
+            logger.log_error("未输入值 取消执行...")
+            return
+
+        deflat2(bv, target_func, swtich_ssa_var, None, switch_var_value)
+    else:
+        interaction.show_message_box("提示", "当前位置不存在switch var变量!\n请在Medium Level IL SSA视图中查找")
         

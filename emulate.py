@@ -247,7 +247,18 @@ class Emulator:
         try:
             self.__m_uc.emu_start(start_addr, end_addr)
         except UcError as e:
-            print(f"Emu Err: {e}")
+            pc_id = None
+            if (self._m_arch == UC_ARCH_ARM64):
+                pc_id = UC_ARM64_REG_PC
+            elif (self._m_arch == UC_ARCH_ARM):
+                pc_id = UC_ARM_REG_PC
+            elif (self._m_arch == UC_ARCH_X86):
+                if (self._m_mode == UC_MODE_32):
+                    pc_id = UC_X86_REG_EIP
+                else:
+                    pc_id = UC_X86_REG_RIP
+
+            print(f"ip: {hex(self.__m_uc.reg_read(pc_id))} | Emu Err: {e}")
             return False
         
         return True
@@ -413,7 +424,9 @@ class DeflatEmulate(FuncEmulate):
             if result != True:
                 ip = self.run_info_var['last']
                 opsize = self.run_info_var['insn_size']
-                run_addr = ip + opsize #遇到发生错误的指令则跳过并继续执行        
+                run_addr = ip + opsize #遇到发生错误的指令则跳过并继续执行 
+            if run_addr >= end_addr:
+                break       
 
     def set_stop_addrs(self, addrs : list):
         """设置停止仿真地址
@@ -473,7 +486,16 @@ class DeflatEmulate(FuncEmulate):
             return 0
         
         #print(f"[Debug] emu_start: {hex(begin_addr)} | user_data : {self.stop_info_var}")
-        super().start_func_emu(begin_addr)
+        
+        result = False
+        run_addr = begin_addr
+        while result != True:
+            result = super().start_func_emu(run_addr)
+            if result != True:
+                ip = self.run_info_var['last']
+                opsize = self.run_info_var['insn_size']
+                run_addr = ip + opsize #遇到发生错误的指令则跳过并继续执行 
+
         #print(f"[Debug] emu_end user_data : {self.stop_info_var}")
         return self.run_info_var['last']
 
@@ -488,7 +510,7 @@ class DeflatEmulate(FuncEmulate):
         if (address == user_data['begin']):
             user_data['loop_count'] += 1
         
-        if user_data['loop_count'] > 3000:
+        if user_data['loop_count'] > 6000:
             uc.emu_stop() #循环次数太多了, 说明switch变量或者其他地方出了问题
     
 

@@ -33,6 +33,18 @@ def get_involve_insns(jmp_insn: MediumLevelILJump):
         if insn_ == None:
             break
 
+        if isinstance(insn_, MediumLevelILVarPhi):  # 如果遇到phi了且不是2个或2个地址不一样, 则取最小的
+            addr_list = []                          
+            for v in insn_.src:
+                addr_list.append(v.def_site.address)
+            if (len(addr_list) != 2) or (len(set(addr_list)) != 1):
+                min_index = addr_list.index(min(addr_list))
+                insn_ = insn_.src[min_index].def_site
+            # 或者直接就停止 
+            """
+            break
+            """
+
         if insn_ in involve_insns:
             break #如果拿到的指令已经在之前获取到的指令中了, 说明遇到循环了
         else:
@@ -40,6 +52,7 @@ def get_involve_insns(jmp_insn: MediumLevelILJump):
 
         if 'cond' in insn_.dest.name:#遇到cond:20#1 = x8#2 == 0x586b6221这种就不再继续了 要不然有可能遇到phi节点导致死循环
             break
+            
 
         insn_right = insn_.src #这条指令=右边的表达式
         get_right_ssa_var(insn_right, var_stack) #拿到表达式中的变量             
@@ -70,6 +83,7 @@ def dejmpreg(bv: BinaryView, func: Function, jmp_insn: MediumLevelILJump, emulat
 
     #拿到涉及到的所有指令
     involve_insns = get_involve_insns(jmp_insn)
+    logger.log_debug(f"involve_insns: {involve_insns}")
     # 判断指令中是否有arg字样, 有则说明有大概率是分析错了(可能是ninja把不该识别成函数的地址识别成函数了, 也可能是脚本分析错了), 需要手动分析
     if manual_value == None:
         arg_insn = None
@@ -123,20 +137,21 @@ def dejmpreg(bv: BinaryView, func: Function, jmp_insn: MediumLevelILJump, emulat
 
     #拿到给csx的两个变量赋值的指令地址
     csx_var_addrs = []
-    tmp_addrs = []
-    for insn in involve_insns:
-        if isinstance(insn, MediumLevelILVarPhi) and (len(insn.src) == 2):
-            phi_var1 = insn.src[0].def_site
-            phi_var2 = insn.src[1].def_site
-            for llil in phi_var1.llils:
-                tmp_addrs.append(llil.address)
-            for llil in phi_var2.llils:
-                tmp_addrs.append(llil.address)
-            break
-    for addr in tmp_addrs:
-        token = (bv.get_disassembly(addr)).split()
-        if (token[0] == 'mov') and (addr not in csx_var_addrs):
-            csx_var_addrs.append(addr)
+    if (insn_token[0] != 'cset'):
+        tmp_addrs = []
+        for insn in involve_insns:
+            if isinstance(insn, MediumLevelILVarPhi) and (len(insn.src) == 2):
+                phi_var1 = insn.src[0].def_site
+                phi_var2 = insn.src[1].def_site
+                for llil in phi_var1.llils:
+                    tmp_addrs.append(llil.address)
+                for llil in phi_var2.llils:
+                    tmp_addrs.append(llil.address)
+                break
+        for addr in tmp_addrs:
+            token = (bv.get_disassembly(addr)).split()
+            if (token[0] == 'mov') and (addr not in csx_var_addrs):
+                csx_var_addrs.append(addr)
     # 如果csx赋值指令为空, 可能是cset, 也可能是某些原因(比如entry块复制)导致拿到的地址不全
     if (len(csx_var_addrs) == 0) and (insn_token[0] != 'cset'): 
         find_over = False
