@@ -1,5 +1,8 @@
 # detx
-去除libtprt.so中的混淆, 去混淆思路看这个贴子[使用BinaryNinja去除libtprt.so的混淆](https://bbs.kanxue.com/thread-282826.htm).  
+去除libtprt.so中的混淆, 去混淆思路看这两个贴子: 
+* [使用BinaryNinja去除libtprt.so的混淆 (一)](https://bbs.kanxue.com/thread-282826.htm).  
+* [使用BinaryNinja去除libtprt.so的混淆 (二)](https://bbs.kanxue.com/thread-282918.htm).  
+
 
 ## 1. 安装说明
 ### 1.1 安装依赖
